@@ -1,0 +1,674 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>VoxelCraft Beta</title>
+<style>
+  html, body { margin: 0; height: 100%; overflow: hidden; background: #78a7ff; }
+  canvas#game { display: block; width: 100%; height: 100%; }
+
+  /* Retro green diagnostics HUD (top-left) */
+  #hud {
+    position: fixed; top: 8px; left: 10px; z-index: 5; pointer-events: none;
+    font: 14px/1.45 "Courier New", Courier, monospace; color: #3dff5a;
+    text-shadow: 0 0 6px rgba(61,255,90,.55), 1px 1px 0 #003b0c;
+    white-space: pre; background: rgba(0,16,4,.35); padding: 6px 10px;
+  }
+
+  /* CSS crosshair: two bars, inverted against the scene */
+  #crosshair { position: fixed; top: 50%; left: 50%; width: 22px; height: 22px;
+    transform: translate(-50%,-50%); pointer-events: none; z-index: 5; mix-blend-mode: difference; }
+  #crosshair::before, #crosshair::after { content: ""; position: absolute; background: #fff; }
+  #crosshair::before { left: 10px; top: 0; width: 2px; height: 22px; }
+  #crosshair::after  { top: 10px; left: 0; height: 2px; width: 22px; }
+
+  /* Hotbar */
+  #hotbar { position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    display: flex; gap: 4px; padding: 4px; z-index: 5; pointer-events: none;
+    background: rgba(30,30,30,.55); border: 2px solid #111; }
+  .slot { width: 48px; height: 48px; box-sizing: border-box; position: relative;
+    background: rgba(90,90,90,.45); border: 3px solid #555; opacity: .8; }
+  .slot canvas { width: 100%; height: 100%; image-rendering: pixelated; display: block; }
+  .slot b { position: absolute; left: 3px; top: 0; font: 12px "Courier New", monospace; color: #fff; text-shadow: 1px 1px #000; }
+  .slot.active { border-color: #fff; opacity: 1; transform: translateY(-4px); box-shadow: 0 0 0 2px #000; }
+
+  /* Hearts, air bubbles, damage flash, stack counts */
+  #hearts { position: fixed; bottom: 84px; left: 50%; margin-left: -238px; z-index: 5; pointer-events: none; display: flex; gap: 2px; }
+  .heart { --f: 100%; font-size: 22px; line-height: 1; color: transparent; -webkit-text-stroke: 1px #000;
+    background: linear-gradient(90deg, #e8262a var(--f), #3a1214 var(--f)); -webkit-background-clip: text; background-clip: text; }
+  #air { position: fixed; bottom: 84px; left: 50%; margin-left: 238px; transform: translateX(-100%); z-index: 5;
+    color: #5ab4ff; font: 16px "Courier New", monospace; letter-spacing: 2px; pointer-events: none; }
+  #hurt { position: fixed; inset: 0; z-index: 4; pointer-events: none; opacity: 0; background: radial-gradient(transparent 40%, rgba(200,0,0,.8)); }
+  .slot i { position: absolute; right: 3px; bottom: 0; font: bold 13px "Courier New", monospace; font-style: normal; color: #fff; text-shadow: 1px 1px #000; }
+
+  /* Start overlay */
+  #overlay { position: fixed; inset: 0; z-index: 10; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 14px; cursor: pointer; text-align: center;
+    background: rgba(20,14,8,.72); color: #f2e6cf; font: 16px/1.6 "Courier New", monospace; }
+  #overlay h1 { margin: 0; font-size: 44px; letter-spacing: 2px; text-shadow: 3px 3px 0 #3b2a14; }
+  #overlay p { margin: 0; color: #cdbb98; }
+  #overlay .go { padding: 10px 28px; background: #6aa84f; border: 3px solid #2e5a1c; color: #fff; text-shadow: 2px 2px #2e5a1c; }
+</style>
+</head>
+<body>
+<canvas id="game"></canvas>
+<div id="crosshair"></div>
+<div id="hud">FPS: --</div>
+<div id="hurt"></div>
+<div id="hearts"></div><div id="air"></div>
+<div id="hotbar"></div>
+<div id="overlay">
+  <h1>VOXELCRAFT BETA</h1>
+  <div class="go">Click to play</div>
+  <p>W A S D move · Space jump · Mouse look<br>Left-click break · Right-click place · 1–9 or wheel select block<br>Esc releases the mouse<br>Broken blocks go into your hotbar (64 per stack) · Lava burns, long falls hurt</p>
+</div>
+
+<!-- Three.js r128 from CDN (pinned version) -->
+<script src="https://cdnjs.cloudflare.com/ajax/libs/three.js/r128/three.min.js"></script>
+<script>
+"use strict";
+
+/* =====================================================================
+ * CONFIG
+ * ===================================================================== */
+const CHUNK = 16;                 // chunk footprint (x/z)
+const WX = 96, WZ = 96, WY = 256;  // world size: 256-high, like pre-1.17 Minecraft
+const SEA = 63;                    // sea level
+const REACH = 6;                  // max interaction distance
+const PLAYER = { w: 0.6, h: 1.8, eye: 1.62 };
+const AIR = 0, GRASS = 1, DIRT = 2, STONE = 3, PLANKS = 4, SAND = 5, GRAVEL = 6, LOG = 7,
+      LEAVES = 8, COBBLE = 9, BEDROCK = 10, WATER = 11, COAL = 12, IRON = 13, LAVA = 14;
+const isLiquid = id => id === WATER || id === LAVA;
+const BLOCK_NAMES = { [GRASS]: "Grass", [DIRT]: "Dirt", [STONE]: "Stone", [COBBLE]: "Cobblestone", [PLANKS]: "Planks",
+  [LOG]: "Log", [LEAVES]: "Leaves", [SAND]: "Sand", [GRAVEL]: "Gravel", [COAL]: "Coal Ore", [IRON]: "Iron Ore" };
+
+/* =====================================================================
+ * PROCEDURAL TEXTURE ATLAS
+ * 5 tiles of 16x16 in one 80x16 canvas -> one texture, one material.
+ * Tile ids: 0 grass-top, 1 grass-side, 2 dirt, 3 stone, 4 planks
+ * ===================================================================== */
+const TILE = 16, TILES = 16;
+const atlas = document.createElement("canvas");
+atlas.width = TILE * TILES; atlas.height = TILE;
+const actx = atlas.getContext("2d");
+
+// Small deterministic PRNG so textures look identical every load
+let seed = 1337;
+const rnd = () => ((seed = (seed * 16807) % 2147483647) / 2147483647);
+
+/** Paint every pixel of tile `t` using fn(x, y) -> [r,g,b] */
+function paintTile(t, fn) {
+  for (let y = 0; y < TILE; y++)
+    for (let x = 0; x < TILE; x++) {
+      const [r, g, b] = fn(x, y);
+      actx.fillStyle = `rgb(${r|0},${g|0},${b|0})`;
+      actx.fillRect(t * TILE + x, y, 1, 1);
+    }
+}
+const shade = (c, k) => c.map(v => Math.max(0, Math.min(255, v + k)));
+
+const grassBase = [96, 160, 56], dirtBase = [134, 96, 67];
+paintTile(0, () => shade(grassBase, (rnd() - .5) * 46));                         // grass top
+paintTile(1, (x, y) => {                                                          // grass side
+  const edge = 3 + ((x * 7 + 3) % 3);                                             // ragged grass fringe
+  return y < edge ? shade(grassBase, (rnd() - .5) * 46) : shade(dirtBase, (rnd() - .5) * 40);
+});
+paintTile(2, () => shade(dirtBase, (rnd() - .5) * 40));                           // dirt
+paintTile(3, (x, y) => {                                                          // stone with cracks
+  const crack = ((x * 3 + y * 5) % 11 === 0) ? -28 : 0;
+  return shade([125, 125, 125], (rnd() - .5) * 36 + crack);
+});
+paintTile(4, (x, y) => {                                                          // wood planks
+  const row = y >> 2;                                                             // 4 boards of 4px
+  const seam = (y % 4 === 3) ? -38 : 0;
+  const joint = (x === ((row % 2) ? 4 : 11) && y % 4 !== 3) ? -30 : 0;            // staggered end joints
+  const grain = Math.sin((x + row * 5) * 1.3) * 7;
+  return shade([176, 138, 84], (rnd() - .5) * 14 + seam + joint + grain);
+});
+
+// Tiles 5-14: sand, gravel, log side, log top, leaves, cobble, bedrock, water, coal ore, iron ore
+paintTile(5, () => shade([218, 205, 150], (rnd() - .5) * 20));
+paintTile(6, () => { const v = 100 + rnd() * 70; return [v, v * .97, v * .95]; });
+paintTile(7, x => shade([102, 78, 48], ((x * 5) % 7 === 0 ? -28 : 0) + (rnd() - .5) * 16));
+paintTile(8, (x, y) => {
+  const d = Math.max(Math.abs(x - 7.5), Math.abs(y - 7.5));            // square growth rings
+  return d > 6 ? shade([102, 78, 48], (rnd() - .5) * 14) : shade([170, 138, 86], ((d | 0) % 2 ? -14 : 0) + (rnd() - .5) * 10);
+});
+paintTile(9, () => rnd() < .2 ? [28, 70, 22] : shade([56, 126, 40], (rnd() - .5) * 40));
+paintTile(10, (x, y) => shade([120, 120, 120], (((x >> 2) + (y >> 2) * 3) % 3) * 14 - 14 + (x % 4 === 0 || y % 4 === 0 ? -32 : 0) + (rnd() - .5) * 18));
+paintTile(11, () => { const v = (30 + rnd() * 70) | 0; return [v, v, v]; });
+paintTile(12, (x, y) => shade([40, 90, 210], Math.sin((x + y * 2) * .9) * 10 + (rnd() - .5) * 12));
+const ORE_PX = new Set(["3,3","4,3","3,4","10,4","11,4","11,5","6,10","7,10","6,11","12,11","3,12","4,12"]);
+const ore = c => (x, y) => ORE_PX.has(x + "," + y) ? shade(c, (rnd() - .5) * 20) : shade([125, 125, 125], (rnd() - .5) * 36);
+paintTile(13, ore([35, 35, 35]));
+paintTile(14, ore([212, 170, 140]));
+paintTile(15, () => rnd() < .12 ? [255, 210, 60] : shade([225, 90, 10], (rnd() - .5) * 60));   // lava
+
+const atlasTex = new THREE.CanvasTexture(atlas);
+atlasTex.magFilter = THREE.NearestFilter;      // crisp retro pixels
+atlasTex.minFilter = THREE.NearestFilter;      // no mipmaps -> no tile bleeding
+atlasTex.generateMipmaps = false;
+
+// Which atlas tile each block uses per face: [top, bottom, side]
+const BLOCK_TILES = { [GRASS]: [0, 2, 1], [DIRT]: [2, 2, 2], [STONE]: [3, 3, 3], [PLANKS]: [4, 4, 4], [SAND]: [5, 5, 5],
+  [GRAVEL]: [6, 6, 6], [LOG]: [8, 8, 7], [LEAVES]: [9, 9, 9], [COBBLE]: [10, 10, 10], [BEDROCK]: [11, 11, 11],
+  [WATER]: [12, 12, 12], [COAL]: [13, 13, 13], [IRON]: [14, 14, 14], [LAVA]: [15, 15, 15] };
+
+/* =====================================================================
+ * WORLD DATA (flat Uint8Array) + TERRAIN GENERATION
+ * ===================================================================== */
+const world = new Uint8Array(WX * WY * WZ);
+const lvl = new Uint8Array(WX * WY * WZ);   // fluid level per cell: 0 = source, 1..7 = flowing (higher = thinner)
+let blockCount = 0, topY = 0;   // topY = highest non-air layer (limits meshing work)
+const idx = (x, y, z) => (y * WZ + z) * WX + x;
+const inBounds = (x, y, z) => x >= 0 && y >= 0 && z >= 0 && x < WX && y < WY && z < WZ;
+const getBlock = (x, y, z) => inBounds(x, y, z) ? world[idx(x, y, z)] : AIR;
+
+function setBlock(x, y, z, id) {
+  if (!inBounds(x, y, z)) return;
+  const i = idx(x, y, z);
+  if (world[i] === AIR && id !== AIR) blockCount++;
+  else if (world[i] !== AIR && id === AIR) blockCount--;
+  world[i] = id;
+  lvl[i] = 0;
+  if (id && y > topY) topY = y;
+}
+
+// Fast seeded value noise: permutation-table hashing (no trig), smoothstep-interpolated.
+const perm = new Uint8Array(512);
+{ const p = [...Array(256).keys()];
+  for (let i = 255; i > 0; i--) { const j = (rnd() * (i + 1)) | 0; [p[i], p[j]] = [p[j], p[i]]; }
+  for (let i = 0; i < 512; i++) perm[i] = p[i & 255]; }
+const fade = t => t * t * (3 - 2 * t), lerp = (a, b, t) => a + (b - a) * t;
+const h3 = (x, y, z) => perm[perm[perm[x & 255] + (y & 255)] + (z & 255)] / 255;
+function noise3(x, y, z) {
+  const xi = Math.floor(x), yi = Math.floor(y), zi = Math.floor(z);
+  const u = fade(x - xi), v = fade(y - yi), w = fade(z - zi);
+  return lerp(
+    lerp(lerp(h3(xi, yi, zi), h3(xi + 1, yi, zi), u), lerp(h3(xi, yi + 1, zi), h3(xi + 1, yi + 1, zi), u), v),
+    lerp(lerp(h3(xi, yi, zi + 1), h3(xi + 1, yi, zi + 1), u), lerp(h3(xi, yi + 1, zi + 1), h3(xi + 1, yi + 1, zi + 1), u), v), w);
+}
+/** Fractal noise: `o` octaves of 2D noise, result 0..1 */
+function fbm(x, z, o) { let a = 1, f = 1, s = 0, n = 0; for (let i = 0; i < o; i++) { s += noise3(x * f, 0, z * f) * a; n += a; a /= 2; f *= 2; } return s / n; }
+
+/** Beta/1.16-style generator: continents + hills + mountains, biomes, beaches, oceans,
+ *  worm caves, ore clumps, bedrock floor and trees. */
+function generateTerrain() {
+  const heights = new Int16Array(WX * WZ), biome = new Uint8Array(WX * WZ);   // biome: 0 plains/forest, 1 desert, 2 mountain
+  for (let x = 0; x < WX; x++)
+    for (let z = 0; z < WZ; z++) {
+      const cont = fbm(x / 110 + 10, z / 110 + 10, 3), hills = fbm(x / 32 + 40, z / 32 + 40, 3);
+      const mnt = fbm(x / 70 + 90, z / 70 + 90, 3), temp = fbm(x / 130 + 200, z / 130 + 200, 2);
+      const ridge = Math.max(0, mnt - .52) * 6;                                // mountains rise sharply
+      const h = Math.max(4, Math.min(WY - 24, Math.floor(SEA + (cont - .47) * 80 + (hills - .5) * 40 + ridge * ridge * 28)));
+      const b = h > SEA + 38 ? 2 : temp > .6 ? 1 : 0;
+      heights[x * WZ + z] = h; biome[x * WZ + z] = b;
+
+      // Surface / sub-surface blocks
+      let top = GRASS, sub = DIRT;
+      if (h <= SEA + 1) { top = sub = noise3(x / 9, 0, z / 9) > .68 ? GRAVEL : SAND; }   // beaches & sea floor
+      else if (b === 1) top = sub = SAND;
+      else if (b === 2) top = sub = STONE;
+
+      const cave = h > SEA + 2 ? h : h - 4;      // tunnels may break the surface on land, never the sea floor
+      for (let y = 0; y <= h; y++) {
+        let id = STONE;
+        if (y === 0 || (y < 4 && rnd() < (4 - y) * .25)) id = BEDROCK;
+        else {
+          if (y > 4 && y <= cave) {              // worm caves = where two noise fields are both near their midline
+            if (Math.abs(noise3(x / 22, y / 14, z / 22) - .5) < .045 && Math.abs(noise3(x / 22 + 100, y / 14 + 100, z / 22 + 100) - .5) < .045) { if (y <= 10) setBlock(x, y, z, LAVA); continue; }   // deep caves hold lava
+          }
+          if (y === h) id = top;
+          else if (y > h - 4) id = sub;
+          else {                                 // ore clumps from small-scale noise
+            const n = noise3(x / 2.2 + 300, y / 2.2, z / 2.2 + 300);
+            if (n > .86 && y < 110) id = COAL; else if (n < .12 && y < 64) id = IRON;
+          }
+        }
+        setBlock(x, y, z, id);
+      }
+      for (let y = h + 1; y <= SEA; y++) setBlock(x, y, z, WATER);               // oceans & lakes
+    }
+
+  // Trees: denser inside "forest" noise patches
+  for (let x = 3; x < WX - 3; x++)
+    for (let z = 3; z < WZ - 3; z++) {
+      const h = heights[x * WZ + z];
+      if (biome[x * WZ + z] || h <= SEA || getBlock(x, h, z) !== GRASS) continue;
+      if (rnd() > (fbm(x / 40 + 500, z / 40 + 500, 2) > .55 ? .03 : .004)) continue;
+      const th = 4 + ((rnd() * 3) | 0);
+      for (let i = 1; i <= th; i++) setBlock(x, h + i, z, LOG);
+      for (let y = h + th - 2; y <= h + th + 1; y++) {
+        const r = y <= h + th - 1 ? 2 : 1;
+        for (let dx = -r; dx <= r; dx++) for (let dz = -r; dz <= r; dz++)
+          if (getBlock(x + dx, y, z + dz) === AIR && !(Math.abs(dx) === r && Math.abs(dz) === r && rnd() < .5)) setBlock(x + dx, y, z + dz, LEAVES);
+      }
+    }
+}
+
+/* =====================================================================
+ * CHUNK MESHING — hidden-face culling, one merged BufferGeometry per chunk
+ * Per-face brightness is baked into vertex colours (no lights needed).
+ * ===================================================================== */
+// Face table: neighbour offset, 4 corners (CCW from outside), brightness, tile slot (0 top,1 bottom,2 side)
+const FACES = [
+  { d: [ 1, 0, 0], c: [[1,0,1],[1,0,0],[1,1,0],[1,1,1]], l: .80, t: 2 },
+  { d: [-1, 0, 0], c: [[0,0,0],[0,0,1],[0,1,1],[0,1,0]], l: .80, t: 2 },
+  { d: [ 0, 1, 0], c: [[0,1,1],[1,1,1],[1,1,0],[0,1,0]], l: 1.0, t: 0 },
+  { d: [ 0,-1, 0], c: [[0,0,0],[1,0,0],[1,0,1],[0,0,1]], l: .50, t: 1 },
+  { d: [ 0, 0, 1], c: [[0,0,1],[1,0,1],[1,1,1],[0,1,1]], l: .65, t: 2 },
+  { d: [ 0, 0,-1], c: [[1,0,0],[0,0,0],[0,1,0],[1,1,0]], l: .65, t: 2 },
+];
+const UV = [[0,0],[1,0],[1,1],[0,1]];
+
+const material = new THREE.MeshBasicMaterial({ map: atlasTex, vertexColors: true });
+const waterMat = new THREE.MeshBasicMaterial({ map: atlasTex, vertexColors: true, transparent: true, opacity: .65, depthWrite: false });
+const chunkMeshes = new Map();   // "cx,cz" -> [opaque mesh, water mesh]
+const scene = new THREE.Scene();
+const opaque = id => id !== AIR && !isLiquid(id);
+
+function buildChunk(cx, cz) {
+  const B = [0, 1].map(() => ({ pos: [], uvs: [], cols: [], ind: [] }));   // [opaque, water]
+  const x0 = cx * CHUNK, z0 = cz * CHUNK, eps = 0.001, tw = 1 / TILES, maxY = Math.min(topY + 1, WY - 1);
+
+  for (let y = 0; y <= maxY; y++)
+    for (let z = z0; z < z0 + CHUNK; z++)
+      for (let x = x0; x < x0 + CHUNK; x++) {
+        const id = world[idx(x, y, z)];
+        if (!id) continue;
+        const w = id === WATER ? 1 : 0, { pos, uvs, cols, ind } = B[w];
+        const lower = isLiquid(id) ? (getBlock(x, y + 1, z) === id ? 0 : Math.min(.85, .12 + lvl[idx(x, y, z)] * .1)) : 0;   // surface drops with flow level        // water surface sits slightly low
+        for (const f of FACES) {
+          const n = getBlock(x + f.d[0], y + f.d[1], z + f.d[2]);
+          if (w ? n !== AIR : (opaque(n) || (id === LAVA && n === LAVA))) continue;                          // hidden face
+          const tile = BLOCK_TILES[id][f.t], base = pos.length / 3;
+          for (let k = 0; k < 4; k++) {
+            pos.push(x + f.c[k][0], y + f.c[k][1] - lower * f.c[k][1], z + f.c[k][2]);
+            uvs.push((tile + (UV[k][0] ? 1 - eps : eps)) * tw, UV[k][1] ? 1 - eps : eps);
+            cols.push(f.l, f.l, f.l);
+          }
+          ind.push(base, base + 1, base + 2, base, base + 2, base + 3);
+        }
+      }
+
+  const key = cx + "," + cz;
+  (chunkMeshes.get(key) || []).forEach(m => { scene.remove(m); m.geometry.dispose(); });
+  const meshes = [];
+  B.forEach((b, i) => {
+    if (!b.ind.length) return;
+    const geo = new THREE.BufferGeometry();
+    geo.setAttribute("position", new THREE.Float32BufferAttribute(b.pos, 3));
+    geo.setAttribute("uv", new THREE.Float32BufferAttribute(b.uvs, 2));
+    geo.setAttribute("color", new THREE.Float32BufferAttribute(b.cols, 3));
+    geo.setIndex(b.ind);
+    geo.computeBoundingSphere();
+    const m = new THREE.Mesh(geo, i ? waterMat : material);
+    if (i) m.renderOrder = 1;                                               // water draws after opaque terrain
+    scene.add(m); meshes.push(m);
+  });
+  chunkMeshes.set(key, meshes);
+}
+
+const dirty = new Set();
+/** Queue the chunk containing (x,z) — plus any edge-sharing neighbour — for remeshing. */
+function markDirty(x, z) {
+  const cx = Math.floor(x / CHUNK), cz = Math.floor(z / CHUNK), lx = x - cx * CHUNK, lz = z - cz * CHUNK;
+  dirty.add(cx + "," + cz);
+  if (lx === 0 && cx > 0) dirty.add((cx - 1) + "," + cz);
+  if (lx === CHUNK - 1 && cx < WX / CHUNK - 1) dirty.add((cx + 1) + "," + cz);
+  if (lz === 0 && cz > 0) dirty.add(cx + "," + (cz - 1));
+  if (lz === CHUNK - 1 && cz < WZ / CHUNK - 1) dirty.add(cx + "," + (cz + 1));
+}
+function flushDirty() { dirty.forEach(k => { const [a, b] = k.split(",").map(Number); buildChunk(a, b); }); dirty.clear(); }
+function rebuildAround(x, z) { markDirty(x, z); flushDirty(); }
+
+/* =====================================================================
+ * RENDERER / SCENE / CAMERA
+ * ===================================================================== */
+const canvas = document.getElementById("game");
+const renderer = new THREE.WebGLRenderer({ canvas, antialias: false, powerPreference: "high-performance" });
+renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+scene.background = new THREE.Color(0x78a7ff);
+scene.fog = new THREE.Fog(0x78a7ff, 45, 130);
+
+const camera = new THREE.PerspectiveCamera(75, 1, 0.05, 200);
+camera.rotation.order = "YXZ";   // yaw then pitch — no roll
+
+function resize() {
+  renderer.setSize(window.innerWidth, window.innerHeight, false);
+  camera.aspect = window.innerWidth / window.innerHeight;
+  camera.updateProjectionMatrix();
+}
+window.addEventListener("resize", resize);
+resize();
+
+// Wireframe cube that outlines the targeted block
+const highlight = new THREE.LineSegments(
+  new THREE.EdgesGeometry(new THREE.BoxGeometry(1.004, 1.004, 1.004)),
+  new THREE.LineBasicMaterial({ color: 0x000000 }));
+highlight.visible = false;
+scene.add(highlight);
+
+/* =====================================================================
+ * PLAYER STATE + AABB COLLISION
+ * ===================================================================== */
+const player = { x: WX / 2 + .5, y: 0, z: WZ / 2 + .5, vx: 0, vy: 0, vz: 0, onGround: false, yaw: 0, pitch: 0,
+  hp: 20, air: 10, peak: 0, tLava: 0, tDrown: 0, tRegen: 0 };   // hp in half-hearts (20 = 10 hearts)
+
+function generateWorld() {
+  generateTerrain();
+  for (let cx = 0; cx < WX / CHUNK; cx++)
+    for (let cz = 0; cz < WZ / CHUNK; cz++) buildChunk(cx, cz);
+  // Spawn: walk outward from the centre to the first dry, tree-free column
+  for (let r = 0; r < WX / 2 - 2; r += 2) {
+    const x = WX / 2 + r, z = WZ / 2;
+    let y = WY - 1; while (y > 0 && !getBlock(x, y, z)) y--;
+    if ([GRASS, SAND, STONE].includes(getBlock(x, y, z)) && y > SEA) { player.x = x + .5; player.z = z + .5; player.y = y + 1.01; return; }
+  }
+  player.y = SEA + 20;
+}
+
+/** Solid test. Side walls and the floor are solid so the player can't leave the map. */
+function solid(x, y, z) {
+  if (x < 0 || z < 0 || x >= WX || z >= WZ || y < 0) return true;
+  if (y >= WY) return false;
+  const b = world[idx(x, y, z)]; return b !== AIR && !isLiquid(b);   // liquids aren't solid
+}
+
+/** Does the player's AABB (feet position x,y,z) overlap any solid block? */
+function collides(px, py, pz) {
+  const r = PLAYER.w / 2;
+  for (let x = Math.floor(px - r); x <= Math.floor(px + r); x++)
+    for (let y = Math.floor(py); y <= Math.floor(py + PLAYER.h); y++)
+      for (let z = Math.floor(pz - r); z <= Math.floor(pz + r); z++)
+        if (solid(x, y, z)) return true;
+  return false;
+}
+
+/** Axis-separated movement so the player slides along walls. */
+function physics(dt) {
+  survival(dt);
+  const GRAV = 28, JUMP = 8.6, wet = isLiquid(getBlock(Math.floor(player.x), Math.floor(player.y + .6), Math.floor(player.z))), SPEED = wet ? 2.6 : 4.6;
+  // Input -> horizontal velocity relative to yaw
+  const f = (keys.KeyW ? 1 : 0) - (keys.KeyS ? 1 : 0);
+  const s = (keys.KeyD ? 1 : 0) - (keys.KeyA ? 1 : 0);
+  const len = Math.hypot(f, s) || 1;
+  const sin = Math.sin(player.yaw), cos = Math.cos(player.yaw);
+  player.vx = ((s * cos) - (f * sin)) / len * SPEED * (f || s ? 1 : 0);
+  player.vz = ((-s * sin) - (f * cos)) / len * SPEED * (f || s ? 1 : 0);
+
+  if (keys.Space && player.onGround && !wet) { player.vy = JUMP; player.onGround = false; }
+  if (wet) player.vy = Math.max(-3, Math.min(4.5, player.vy + ((keys.Space ? 26 : 0) - 10) * dt));   // swim: Space rises, otherwise sink slowly
+  else player.vy = Math.max(player.vy - GRAV * dt, -40);
+
+  // X
+  player.x += player.vx * dt;
+  if (collides(player.x, player.y, player.z)) { player.x -= player.vx * dt; }
+  // Z
+  player.z += player.vz * dt;
+  if (collides(player.x, player.y, player.z)) { player.z -= player.vz * dt; }
+  // Y (snap to the block boundary so there is no hovering gap)
+  player.y += player.vy * dt;
+  player.onGround = false;
+  if (collides(player.x, player.y, player.z)) {
+    if (player.vy < 0) { player.y = Math.floor(player.y) + 1 + 1e-3; player.onGround = true;
+      const d = Math.floor(player.peak - player.y - 3); if (d > 0 && !wet) hurt(d); }   // fall damage beyond 3 blocks
+    else player.y = Math.floor(player.y + PLAYER.h) - PLAYER.h - 1e-3;
+    player.vy = 0;
+  }
+  player.peak = (player.onGround || wet) ? player.y : Math.max(player.peak, player.y);   // highest point of current fall
+  if (player.y < -20) { player.y = WY; player.vy = 0; }   // safety net
+}
+
+/* =====================================================================
+ * VOXEL RAYCAST (Amanatides–Woo DDA) — exact hit block + entry face
+ * ===================================================================== */
+function raycast(origin, dir, maxDist) {
+  let x = Math.floor(origin.x), y = Math.floor(origin.y), z = Math.floor(origin.z);
+  const sx = Math.sign(dir.x), sy = Math.sign(dir.y), sz = Math.sign(dir.z);
+  const tdx = Math.abs(1 / dir.x), tdy = Math.abs(1 / dir.y), tdz = Math.abs(1 / dir.z);
+  let tx = dir.x ? ((sx > 0 ? x + 1 - origin.x : origin.x - x) * tdx) : Infinity;
+  let ty = dir.y ? ((sy > 0 ? y + 1 - origin.y : origin.y - y) * tdy) : Infinity;
+  let tz = dir.z ? ((sz > 0 ? z + 1 - origin.z : origin.z - z) * tdz) : Infinity;
+  let nx = 0, ny = 0, nz = 0, t = 0;
+  while (t <= maxDist) {
+    { const b = getBlock(x, y, z); if (b && !isLiquid(b)) return { x, y, z, nx, ny, nz }; }   // rays pass through water
+    if (tx < ty && tx < tz) { x += sx; t = tx; tx += tdx; nx = -sx; ny = 0; nz = 0; }
+    else if (ty < tz)       { y += sy; t = ty; ty += tdy; nx = 0; ny = -sy; nz = 0; }
+    else                    { z += sz; t = tz; tz += tdz; nx = 0; ny = 0; nz = -sz; }
+  }
+  return null;
+}
+
+let target = null;
+const rayDir = new THREE.Vector3();
+
+function updateTarget() {
+  camera.getWorldDirection(rayDir);
+  target = raycast(camera.position, rayDir, REACH);
+  highlight.visible = !!target;
+  if (target) highlight.position.set(target.x + .5, target.y + .5, target.z + .5);
+}
+
+const DROPS = { [GRASS]: DIRT, [STONE]: COBBLE };   // what breaking a block gives you
+function breakBlock() {
+  if (!target) return;
+  const b = getBlock(target.x, target.y, target.z);
+  if (b === BEDROCK) return;
+  addItem(DROPS[b] || b);                            // with a full hotbar the drop is lost
+  setBlock(target.x, target.y, target.z, AIR);
+  wake(target.x, target.y, target.z);
+  rebuildAround(target.x, target.z);
+}
+
+function placeBlock() {
+  if (!target) return;
+  const x = target.x + target.nx, y = target.y + target.ny, z = target.z + target.nz;
+  if (!inBounds(x, y, z) || (getBlock(x, y, z) && !isLiquid(getBlock(x, y, z)))) return;
+  // Don't place a block inside the player
+  const r = PLAYER.w / 2;
+  if (x + 1 > player.x - r && x < player.x + r && y + 1 > player.y && y < player.y + PLAYER.h &&
+      z + 1 > player.z - r && z < player.z + r) return;
+  const s = slots[selected]; if (s.n < 1) return;    // empty slot
+  setBlock(x, y, z, s.id);
+  if (--s.n === 0) s.id = AIR;
+  refreshHotbar(); wake(x, y, z); rebuildAround(x, z);
+}
+
+/* =====================================================================
+ * FLUIDS & FALLING BLOCKS — cellular automata, ticked 8x per second
+ * Water spreads up to 7 cells (lava 3, and 4x slower); liquids fall, and a flow
+ * with no feeder drains away. Water meeting lava turns it to cobblestone.
+ * ===================================================================== */
+const MAXL = { [WATER]: 7, [LAVA]: 3 }, FALLERS = new Set([SAND, GRAVEL]);
+const N4 = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+const NB7 = [[0,0,0],[1,0,0],[-1,0,0],[0,1,0],[0,-1,0],[0,0,1],[0,0,-1]];
+const pending = new Set();
+
+/** Re-check this cell and its neighbours next tick (only fluids/sand/gravel need it). */
+function wake(x, y, z) {
+  for (const [dx, dy, dz] of NB7) {
+    const X = x + dx, Y = y + dy, Z = z + dz;
+    if (!inBounds(X, Y, Z)) continue;
+    const b = world[idx(X, Y, Z)];
+    if (isLiquid(b) || FALLERS.has(b)) pending.add(idx(X, Y, Z));
+  }
+}
+/** Change a cell as part of the simulation: remesh + wake neighbours. */
+function put(x, y, z, id, l = 0) { setBlock(x, y, z, id); lvl[idx(x, y, z)] = l; markDirty(x, z); wake(x, y, z); }
+
+function tickCell(i) {
+  const x = i % WX, z = ((i / WX) | 0) % WZ, y = (i / (WX * WZ)) | 0, id = world[i];
+  if (FALLERS.has(id)) {                                   // sand & gravel drop through air and liquid
+    const b = getBlock(x, y - 1, z);
+    if (y > 0 && (b === AIR || isLiquid(b))) { put(x, y, z, AIR); put(x, y - 1, z, id); }
+    return;
+  }
+  if (!isLiquid(id)) return;
+  const L = lvl[i];
+  if (L > 0) {                                             // a flow needs a feeder: liquid above or a stronger neighbour
+    let ok = getBlock(x, y + 1, z) === id;
+    for (const [dx, dz] of N4) if (!ok && getBlock(x + dx, y, z + dz) === id && lvl[idx(x + dx, y, z + dz)] < L) ok = true;
+    if (!ok) { put(x, y, z, AIR); return; }
+  }
+  const below = y > 0 ? getBlock(x, y - 1, z) : -1;
+  if (below === AIR) { put(x, y - 1, z, id, 1); return; }                    // fall first
+  if (isLiquid(below) && below !== id) { put(x, y - 1, z, COBBLE); return; } // water + lava
+  if (L >= MAXL[id]) return;
+  for (const [dx, dz] of N4) {                             // then spread sideways
+    const X = x + dx, Z = z + dz;
+    if (!inBounds(X, y, Z)) continue;
+    const t = world[idx(X, y, Z)];
+    if (t === AIR) put(X, y, Z, id, L + 1);
+    else if (isLiquid(t) && t !== id) put(X, y, Z, COBBLE);
+    else if (t === id && lvl[idx(X, y, Z)] > L + 1) put(X, y, Z, id, L + 1);
+  }
+}
+
+let fluidT = 0, tickN = 0;
+function fluidTick(dt) {
+  fluidT += dt; if (fluidT < .125) return;
+  fluidT = 0; tickN++;
+  if (!pending.size) return;
+  const cur = [...pending]; pending.clear();
+  for (const i of cur) { if (world[i] === LAVA && tickN % 4) pending.add(i); else tickCell(i); }
+  flushDirty();
+}
+
+/* =====================================================================
+ * SURVIVAL — hearts, fall damage, lava, drowning, regeneration
+ * ===================================================================== */
+const heartsEl = document.getElementById("hearts"), airEl = document.getElementById("air"), hurtEl = document.getElementById("hurt");
+let hurtOp = 0, spawn = null;
+for (let i = 0; i < 10; i++) heartsEl.insertAdjacentHTML("beforeend", '<span class="heart">♥</span>');
+function drawHearts() {
+  [...heartsEl.children].forEach((h, i) => h.style.setProperty("--f", Math.max(0, Math.min(1, (player.hp - i * 2) / 2)) * 100 + "%"));
+}
+function hurt(n) { player.hp -= n; hurtOp = .55; if (player.hp <= 0) respawn(); drawHearts(); }
+function respawn() {
+  Object.assign(player, { x: spawn.x, y: spawn.y, z: spawn.z, vx: 0, vy: 0, vz: 0, hp: 20, air: 10, peak: spawn.y });
+  hurtOp = 1;
+}
+function survival(dt) {
+  const at = h => getBlock(Math.floor(player.x), Math.floor(player.y + h), Math.floor(player.z));
+  if (at(.2) === LAVA || at(1) === LAVA || at(PLAYER.eye) === LAVA) {        // lava burns
+    if ((player.tLava += dt) >= .5) { player.tLava = 0; hurt(3); }
+  } else player.tLava = 0;
+  if (at(PLAYER.eye) === WATER) {                                            // 10 s of breath, then drowning
+    player.air -= dt;
+    if (player.air < 0 && (player.tDrown += dt) >= 1) { player.tDrown = 0; hurt(2); }
+  } else { player.air = Math.min(10, player.air + dt * 4); player.tDrown = 0; }
+  if (player.hp < 20 && (player.tRegen += dt) >= 4) { player.tRegen = 0; player.hp++; drawHearts(); }
+}
+drawHearts();
+
+/* =====================================================================
+ * HOTBAR
+ * ===================================================================== */
+// Limited inventory: 9 slots, 64 per stack. Empty slots hold {id: AIR, n: 0}.
+const slots = Array.from({ length: 9 }, () => ({ id: AIR, n: 0 }));
+slots[0] = { id: PLANKS, n: 16 };                       // starter stack
+let selected = 0;
+const hotbarEl = document.getElementById("hotbar");
+const slotEls = slots.map((_, i) => {
+  const el = document.createElement("div");
+  el.className = "slot";
+  const c = document.createElement("canvas"); c.width = c.height = TILE;
+  el.appendChild(c);
+  el.insertAdjacentHTML("beforeend", `<b>${i + 1}</b><i></i>`);
+  hotbarEl.appendChild(el);
+  return el;
+});
+/** Redraw icons, counts and the active highlight. */
+function refreshHotbar() {
+  slotEls.forEach((el, i) => {
+    const s = slots[i], g = el.firstChild.getContext("2d");
+    g.clearRect(0, 0, TILE, TILE);
+    if (s.n > 0) g.drawImage(atlas, BLOCK_TILES[s.id][2] * TILE, 0, TILE, TILE, 0, 0, TILE, TILE);   // side tile as icon
+    el.querySelector("i").textContent = s.n > 1 ? s.n : "";
+    el.title = s.n > 0 ? BLOCK_NAMES[s.id] : "";
+    el.classList.toggle("active", i === selected);
+  });
+}
+/** Add one item: top up a matching stack, else take the first empty slot. Returns false if full. */
+function addItem(id) {
+  const s = slots.find(s => s.id === id && s.n > 0 && s.n < 64) || slots.find(s => s.n === 0);
+  if (!s) return false;
+  s.id = id; s.n++; refreshHotbar(); return true;
+}
+function selectSlot(i) { selected = (i + slots.length) % slots.length; refreshHotbar(); }
+selectSlot(0);
+
+/* =====================================================================
+ * INPUT — native Pointer Lock API + keyboard
+ * ===================================================================== */
+const keys = {};
+const overlay = document.getElementById("overlay");
+const locked = () => document.pointerLockElement === canvas;
+
+overlay.addEventListener("click", () => canvas.requestPointerLock());
+document.addEventListener("pointerlockchange", () => { overlay.style.display = locked() ? "none" : "flex"; });
+
+document.addEventListener("mousemove", e => {
+  if (!locked()) return;
+  player.yaw -= e.movementX * 0.0022;
+  player.pitch = Math.max(-Math.PI / 2 + .01, Math.min(Math.PI / 2 - .01, player.pitch - e.movementY * 0.0022));
+});
+document.addEventListener("mousedown", e => {
+  if (!locked()) return;
+  if (e.button === 0) breakBlock();
+  else if (e.button === 2) placeBlock();
+});
+document.addEventListener("contextmenu", e => e.preventDefault());
+document.addEventListener("wheel", e => { if (locked()) selectSlot(selected + Math.sign(e.deltaY)); });
+document.addEventListener("keydown", e => {
+  keys[e.code] = true;
+  if (e.code === "Space") e.preventDefault();
+  if (e.code >= "Digit1" && e.code <= "Digit9") selectSlot(+e.code.slice(5) - 1);
+});
+document.addEventListener("keyup", e => { keys[e.code] = false; });
+window.addEventListener("blur", () => { for (const k in keys) keys[k] = false; });
+
+/* =====================================================================
+ * MAIN LOOP + DIAGNOSTICS HUD
+ * ===================================================================== */
+const hud = document.getElementById("hud");
+let last = performance.now(), fpsTime = 0, fpsFrames = 0, fps = 0;
+
+function frame(now) {
+  requestAnimationFrame(frame);
+  const delta = (now - last) / 1000;      // seconds since previous frame
+  last = now;
+
+  // Manual FPS: count frames, refresh the readout twice a second
+  fpsFrames++; fpsTime += delta;
+  if (fpsTime >= 0.5) {
+    fps = Math.round(fpsFrames / fpsTime);
+    fpsFrames = 0; fpsTime = 0;
+    hud.textContent =
+      `FPS:    ${fps}\n` +
+      `BLOCKS: ${blockCount.toLocaleString()}\n` +
+      `X: ${player.x.toFixed(2)}\n` +
+      `Y: ${player.y.toFixed(2)}\n` +
+      `Z: ${player.z.toFixed(2)}`;
+  }
+
+  // Physics in fixed-ish substeps (clamped so tab-switches can't tunnel through floors)
+  let dt = Math.min(delta, 0.05);
+  if (locked()) { while (dt > 0) { const s = Math.min(dt, 1 / 120); physics(s); dt -= s; } fluidTick(Math.min(delta, .05)); }
+  hurtOp = Math.max(0, hurtOp - delta * 1.2); hurtEl.style.opacity = hurtOp;
+  airEl.textContent = player.air < 10 ? "●".repeat(Math.ceil(Math.max(0, player.air))) : "";
+
+  camera.position.set(player.x, player.y + PLAYER.eye, player.z);
+  camera.rotation.set(player.pitch, player.yaw, 0);
+  updateTarget();
+  renderer.render(scene, camera);
+}
+
+generateWorld();
+spawn = { x: player.x, y: player.y, z: player.z };   // respawn point
+requestAnimationFrame(frame);
+</script>
+</body>
+</html>
